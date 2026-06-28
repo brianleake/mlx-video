@@ -29,7 +29,7 @@ def test_causal_matches_block_causal_reference():
     outs = []
     for b in range(F // fb):
         sf = b * fb
-        outs.append(attn(x[:, sf * fsl:(sf + fb) * fsl], [(fb, H, W)], freqs, cache, sf))
+        outs.append(attn(x[:, sf * fsl:(sf + fb) * fsl], [(fb, H, W)], freqs, cache, sf, commit=True))
     block_out = mx.concatenate(outs, axis=1)
 
     n, d = heads, dim // heads
@@ -55,7 +55,7 @@ def test_bounded_cache_evicts():
     cache = CausalKVCache(sink_size=1, local_attn_size=2, frame_seqlen=fsl)
     for b in range(3):
         blk = mx.zeros((1, 3 * fsl, 4, 16))
-        cache.append(blk, blk)
+        cache.commit(blk, blk)
     assert cache.k.shape[1] <= (1 + 2) * fsl
 
 

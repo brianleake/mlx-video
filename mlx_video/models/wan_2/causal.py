@@ -96,8 +96,19 @@ class CausalKVCache:
         self.k = None
         self.v = None
 
-    def append(self, k: mx.array, v: mx.array) -> tuple[mx.array, mx.array]:
-        """Append a block's K/V ([B, s, n, d]); return the full (windowed) cache."""
+    def view_with(self, k: mx.array, v: mx.array) -> tuple[mx.array, mx.array]:
+        """Return persistent cache ++ this block's K/V WITHOUT persisting.
+
+        Used during the multi-step denoise: the block attends to clean past
+        (persistent) + its own (noisy, this step) K/V, but the noisy intermediates
+        must not pollute the cache. Only the clean re-run commits (see `commit`).
+        """
+        if self.k is None:
+            return k, v
+        return mx.concatenate([self.k, k], axis=1), mx.concatenate([self.v, v], axis=1)
+
+    def commit(self, k: mx.array, v: mx.array) -> tuple[mx.array, mx.array]:
+        """Persist a block's clean K/V ([B, s, n, d]); return the full windowed cache."""
         if self.k is None:
             self.k, self.v = k, v
         else:
@@ -150,6 +161,7 @@ class WanCausalSelfAttention(nn.Module):
         freqs: mx.array,
         cache: CausalKVCache,
         start_frame: int,
+        commit: bool = False,
     ) -> mx.array:
         b, s, _ = x.shape
         n, d = self.num_heads, self.head_dim
@@ -172,7 +184,7 @@ class WanCausalSelfAttention(nn.Module):
         q = q.astype(w_dtype)
         k = k.astype(w_dtype)
 
-        full_k, full_v = cache.append(k, v)
+        full_k, full_v = cache.commit(k, v) if commit else cache.view_with(k, v)
 
         out = mx.fast.scaled_dot_product_attention(
             q.transpose(0, 2, 1, 3),
@@ -229,18 +241,22 @@ class CausalWanModel(WanModel):
         self_caches: list,
         cross_kv_caches: list,
         start_frame: int,
+        commit: bool = False,
     ) -> mx.array:
-        """Denoise one block of latent frames.
+        """Denoise one block of latent frames (or, with commit=True, write its
+        clean K/V into the KV-cache).
 
         Args:
             x_block: latent [C, F, H, W] for this block (F = num_frame_per_block)
             t_block: per-frame integer timestep [F] (or scalar)
             context: pre-embedded text [1, text_len, dim] (see embed_text)
-            self_caches: per-layer CausalKVCache (mutated in place)
+            self_caches: per-layer CausalKVCache (mutated in place only if commit)
             cross_kv_caches: per-layer (k, v) from prepare_cross_kv
             start_frame: absolute latent-frame index of this block's first frame
+            commit: if True, persist this block's (clean) K/V into the cache;
+                if False, attend to past + this block without persisting
         Returns:
-            denoised latent [C, F, H, W]
+            model output (flow/velocity) latent [C, F, H, W]
         """
         p, gs = self._patchify(x_block)  # [1, S, dim], gs = (F, H, W)
         f, h, w = gs
@@ -260,7 +276,7 @@ class CausalWanModel(WanModel):
         for i, blk in enumerate(self.blocks):
             mod = blk.modulation + e0  # [1, S, 6, dim] (float32)
             x_mod = blk.norm1(x) * (1 + mod[:, :, 1, :]) + mod[:, :, 0, :]
-            y = blk.self_attn(x_mod, [gs], self.freqs, self_caches[i], start_frame)
+            y = blk.self_attn(x_mod, [gs], self.freqs, self_caches[i], start_frame, commit)
             x = x + y * mod[:, :, 2, :]
 
             x_cross = blk.norm3(x) if blk.norm3 is not None else x

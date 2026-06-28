@@ -39,12 +39,12 @@ def test_causal_model_loads_and_forwards():
     x = mx.random.normal((C, F, Hl, Wl)).astype(mx.float32)
     t = mx.array([900, 900, 900])
 
-    out = model.generate_block(x, t, context, caches, cross, start_frame=0)
+    out = model.generate_block(x, t, context, caches, cross, start_frame=0, commit=True)
     mx.eval(out)
     assert out.shape == (C, F, Hl, Wl)
     assert not bool(mx.any(mx.isnan(out)))
 
-    model.generate_block(x, t, context, caches, cross, start_frame=F)
+    model.generate_block(x, t, context, caches, cross, start_frame=F, commit=True)
     assert caches[0].k.shape[1] == 2 * F * fsl
 
 
