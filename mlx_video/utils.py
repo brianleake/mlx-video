@@ -301,3 +301,32 @@ def prepare_image_for_encoding(
     image = mx.expand_dims(image, axis=2)  # (1, 3, 1, H, W)
 
     return image.astype(dtype)
+
+
+def load_clip_for_encoding(
+    frames_dir: str,
+    num_frames: int,
+    target_height: int,
+    target_width: int,
+    dtype: mx.Dtype = mx.float32,
+) -> mx.array:
+    """Load the last `num_frames` PNG frames from a directory as a conditioning
+    clip for VAE encoding (StreamFrame FramePack-style history conditioning).
+
+    Returns a tensor of shape (1, 3, num_frames, H, W) in [-1, 1]. `num_frames`
+    must satisfy 1 + 8*x (VAE temporal constraint), e.g. 1, 9, 17.
+    """
+    from pathlib import Path
+
+    files = sorted(Path(frames_dir).glob("*.png"))[-num_frames:]
+    arrs = []
+    for f in files:
+        img = Image.open(f).convert("RGB").resize(
+            (target_width, target_height), Image.Resampling.LANCZOS
+        )
+        arrs.append(np.array(img).astype(np.float32) / 255.0)
+    clip = np.stack(arrs, axis=0)            # (K, H, W, 3)
+    clip = clip * 2.0 - 1.0                  # [-1, 1]
+    clip = np.transpose(clip, (3, 0, 1, 2))  # (3, K, H, W)
+    clip = clip[None]                        # (1, 3, K, H, W)
+    return mx.array(clip).astype(dtype)

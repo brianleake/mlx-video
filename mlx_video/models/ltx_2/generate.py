@@ -41,6 +41,7 @@ from mlx_video.models.ltx_2.video_vae.decoder import VideoDecoder
 from mlx_video.models.ltx_2.video_vae.tiling import TilingConfig
 from mlx_video.utils import (
     get_model_path,
+    load_clip_for_encoding,
     load_image,
     prepare_image_for_encoding,
 )
@@ -1765,6 +1766,8 @@ def generate_video(
     audio_start_time: float = 0.0,
     spatial_upscaler: Optional[str] = None,
     preview_path: Optional[str] = None,
+    cond_video: Optional[str] = None,
+    cond_frames: int = 9,
 ):
     """Generate video using LTX-2 models.
 
@@ -1825,7 +1828,7 @@ def generate_video(
         )
         num_frames = adjusted_num_frames
 
-    is_i2v = image is not None or end_image is not None
+    is_i2v = image is not None or end_image is not None or cond_video is not None
     has_end_image = end_image is not None
     if end_image_strength is None:
         end_image_strength = image_strength
@@ -2123,7 +2126,19 @@ def generate_video(
                 s1_h, s1_w = stage1_h * 32, stage1_w * 32
                 s2_h, s2_w = stage2_h * 32, stage2_w * 32
 
-                if image is not None:
+                if cond_video is not None:
+                    # FramePack-style history conditioning (StreamFrame): encode a
+                    # short clip — the previous chunk's last `cond_frames` frames —
+                    # so the chunk continues motion/identity rather than re-starting
+                    # from a single still. The conditioning machinery injects all
+                    # of these latent frames at the head of the new clip.
+                    clip1 = load_clip_for_encoding(cond_video, cond_frames, s1_h, s1_w, dtype=model_dtype)
+                    stage1_image_latent = vae_encoder(clip1)
+                    mx.eval(stage1_image_latent)
+                    clip2 = load_clip_for_encoding(cond_video, cond_frames, s2_h, s2_w, dtype=model_dtype)
+                    stage2_image_latent = vae_encoder(clip2)
+                    mx.eval(stage2_image_latent)
+                elif image is not None:
                     input_image = load_image(image, height=s1_h, width=s1_w, dtype=model_dtype)
                     stage1_image_latent = vae_encoder(prepare_image_for_encoding(input_image, s1_h, s1_w, dtype=model_dtype))
                     mx.eval(stage1_image_latent)
@@ -2442,7 +2457,19 @@ def generate_video(
                 s1_h, s1_w = stage1_h * 32, stage1_w * 32
                 s2_h, s2_w = stage2_h * 32, stage2_w * 32
 
-                if image is not None:
+                if cond_video is not None:
+                    # FramePack-style history conditioning (StreamFrame): encode a
+                    # short clip — the previous chunk's last `cond_frames` frames —
+                    # so the chunk continues motion/identity rather than re-starting
+                    # from a single still. The conditioning machinery injects all
+                    # of these latent frames at the head of the new clip.
+                    clip1 = load_clip_for_encoding(cond_video, cond_frames, s1_h, s1_w, dtype=model_dtype)
+                    stage1_image_latent = vae_encoder(clip1)
+                    mx.eval(stage1_image_latent)
+                    clip2 = load_clip_for_encoding(cond_video, cond_frames, s2_h, s2_w, dtype=model_dtype)
+                    stage2_image_latent = vae_encoder(clip2)
+                    mx.eval(stage2_image_latent)
+                elif image is not None:
                     input_image = load_image(image, height=s1_h, width=s1_w, dtype=model_dtype)
                     stage1_image_latent = vae_encoder(prepare_image_for_encoding(input_image, s1_h, s1_w, dtype=model_dtype))
                     mx.eval(stage1_image_latent)
@@ -2696,7 +2723,19 @@ def generate_video(
                 s1_h, s1_w = stage1_h * 32, stage1_w * 32
                 s2_h, s2_w = stage2_h * 32, stage2_w * 32
 
-                if image is not None:
+                if cond_video is not None:
+                    # FramePack-style history conditioning (StreamFrame): encode a
+                    # short clip — the previous chunk's last `cond_frames` frames —
+                    # so the chunk continues motion/identity rather than re-starting
+                    # from a single still. The conditioning machinery injects all
+                    # of these latent frames at the head of the new clip.
+                    clip1 = load_clip_for_encoding(cond_video, cond_frames, s1_h, s1_w, dtype=model_dtype)
+                    stage1_image_latent = vae_encoder(clip1)
+                    mx.eval(stage1_image_latent)
+                    clip2 = load_clip_for_encoding(cond_video, cond_frames, s2_h, s2_w, dtype=model_dtype)
+                    stage2_image_latent = vae_encoder(clip2)
+                    mx.eval(stage2_image_latent)
+                elif image is not None:
                     input_image = load_image(image, height=s1_h, width=s1_w, dtype=model_dtype)
                     stage1_image_latent = vae_encoder(prepare_image_for_encoding(input_image, s1_h, s1_w, dtype=model_dtype))
                     mx.eval(stage1_image_latent)
@@ -3395,6 +3434,20 @@ Examples:
         help="StreamFrame: write a rough mid-generation preview PNG here and print "
         "a STREAMFRAME_PREVIEW marker (live preview for short clips).",
     )
+    parser.add_argument(
+        "--cond-video",
+        type=str,
+        default=None,
+        help="StreamFrame: directory of PNG frames to use as a history clip "
+        "(FramePack-style conditioning); the last --cond-frames are encoded and "
+        "injected at the head of the new clip to continue motion and reduce drift.",
+    )
+    parser.add_argument(
+        "--cond-frames",
+        type=int,
+        default=9,
+        help="Number of history frames from --cond-video to condition on (1 + 8*k).",
+    )
     args = parser.parse_args()
 
     pipeline_map = {
@@ -3449,6 +3502,8 @@ Examples:
         audio_start_time=args.audio_start_time,
         spatial_upscaler=args.spatial_upscaler,
         preview_path=args.preview_path,
+        cond_video=args.cond_video,
+        cond_frames=args.cond_frames,
     )
 
 
