@@ -620,6 +620,26 @@ def denoise_distilled(
     return latents.astype(dtype), audio_latents.astype(dtype) if enable_audio else None
 
 
+def save_preview_frame(latents, vae_decoder, path: str) -> None:
+    """Best-effort live-preview hook (StreamFrame): decode the given latents and
+    write frame 0 as a PNG at `path`, then print a marker line so a host process
+    can pick it up. Used to show a rough mid-generation frame for short clips."""
+    try:
+        import numpy as _np
+        from PIL import Image as _Image
+
+        video = vae_decoder(latents)
+        mx.eval(video)
+        frame = video[0, :, 0]                     # (C, H, W)
+        frame = mx.transpose(frame, (1, 2, 0))     # (H, W, C)
+        frame = mx.clip((frame + 1.0) / 2.0, 0.0, 1.0)
+        frame = (frame * 255).astype(mx.uint8)
+        _Image.fromarray(_np.array(frame)).save(path)
+        print("STREAMFRAME_PREVIEW", flush=True)
+    except Exception:
+        pass  # preview is strictly best-effort; never break generation
+
+
 # =============================================================================
 # Dev Pipeline Denoising (with CFG, dynamic sigmas)
 # =============================================================================
@@ -1744,6 +1764,7 @@ def generate_video(
     audio_file: Optional[str] = None,
     audio_start_time: float = 0.0,
     spatial_upscaler: Optional[str] = None,
+    preview_path: Optional[str] = None,
 ):
     """Generate video using LTX-2 models.
 
@@ -2200,6 +2221,11 @@ def generate_video(
             vae_decoder = VideoDecoder.from_pretrained(
                 str(model_path / "vae" / "decoder")
             )
+
+            # StreamFrame live preview: decode the rough stage-1 latents now so a
+            # host can show a mid-generation frame (before the slower stage 2).
+            if preview_path:
+                save_preview_frame(latents, vae_decoder, preview_path)
 
             latents = upsample_latents(
                 latents,
@@ -3362,6 +3388,13 @@ Examples:
         help="Spatial upscaler filename (e.g. ltx-2.3-spatial-upscaler-x1.5-1.0.safetensors). "
         "Auto-detects x2 by default. Use this to select x1.5 or a specific version.",
     )
+    parser.add_argument(
+        "--preview-path",
+        type=str,
+        default=None,
+        help="StreamFrame: write a rough mid-generation preview PNG here and print "
+        "a STREAMFRAME_PREVIEW marker (live preview for short clips).",
+    )
     args = parser.parse_args()
 
     pipeline_map = {
@@ -3415,6 +3448,7 @@ Examples:
         audio_file=args.audio_file,
         audio_start_time=args.audio_start_time,
         spatial_upscaler=args.spatial_upscaler,
+        preview_path=args.preview_path,
     )
 
 
