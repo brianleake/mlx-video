@@ -20,6 +20,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .attention import WanRMSNorm, _linear_dtype
+from .wan_2 import WanModel
 
 
 def causal_rope_apply(
@@ -181,3 +182,92 @@ class WanCausalSelfAttention(nn.Module):
         )
         out = out.transpose(0, 2, 1, 3).reshape(b, s, -1)
         return self.o(out)
+
+
+class CausalWanModel(WanModel):
+    """Wan2.1 backbone in causal/autoregressive mode (Causal-Forcing weights).
+
+    Same parameters as WanModel (so the converted Causal-Forcing weights load
+    unchanged) but each block's bidirectional self-attention is replaced with the
+    cached WanCausalSelfAttention, and generation runs one block (`num_frame_per_block`
+    latent frames) at a time through `generate_block`, carrying per-layer KV-caches.
+    """
+
+    def __init__(
+        self,
+        config,
+        sink_size: int = 1,
+        local_attn_size: int = -1,
+        num_frame_per_block: int = 3,
+    ):
+        super().__init__(config)
+        for blk in self.blocks:
+            blk.self_attn = WanCausalSelfAttention(
+                config.dim,
+                config.num_heads,
+                sink_size=sink_size,
+                local_attn_size=local_attn_size,
+                qk_norm=config.qk_norm,
+                eps=config.eps,
+            )
+        self.sink_size = sink_size
+        self.local_attn_size = local_attn_size
+        self.num_frame_per_block = num_frame_per_block
+
+    def make_self_caches(self, frame_seqlen: int) -> list:
+        """One bounded KV-cache per transformer layer."""
+        return [
+            CausalKVCache(self.sink_size, self.local_attn_size, frame_seqlen)
+            for _ in self.blocks
+        ]
+
+    def generate_block(
+        self,
+        x_block: mx.array,
+        t_block: mx.array,
+        context: mx.array,
+        self_caches: list,
+        cross_kv_caches: list,
+        start_frame: int,
+    ) -> mx.array:
+        """Denoise one block of latent frames.
+
+        Args:
+            x_block: latent [C, F, H, W] for this block (F = num_frame_per_block)
+            t_block: per-frame integer timestep [F] (or scalar)
+            context: pre-embedded text [1, text_len, dim] (see embed_text)
+            self_caches: per-layer CausalKVCache (mutated in place)
+            cross_kv_caches: per-layer (k, v) from prepare_cross_kv
+            start_frame: absolute latent-frame index of this block's first frame
+        Returns:
+            denoised latent [C, F, H, W]
+        """
+        p, gs = self._patchify(x_block)  # [1, S, dim], gs = (F, H, W)
+        f, h, w = gs
+        fsl = h * w
+        S = f * fsl
+        x = p
+
+        # Per-frame timestep -> per-token, then the standard sinusoidal time MLP.
+        if t_block.ndim == 0:
+            t_block = mx.broadcast_to(t_block[None], (f,))
+        t_tok = mx.repeat(t_block, fsl)[None]  # [1, S]
+        sinusoid = t_tok[..., None].astype(mx.float32) * self._inv_freq
+        sin_emb = mx.concatenate([mx.cos(sinusoid), mx.sin(sinusoid)], axis=-1)
+        e = self.time_embedding_1(self.time_embedding_act(self.time_embedding_0(sin_emb)))
+        e0 = self.time_projection(self.time_projection_act(e)).reshape(1, S, 6, self.dim)
+
+        for i, blk in enumerate(self.blocks):
+            mod = blk.modulation + e0  # [1, S, 6, dim] (float32)
+            x_mod = blk.norm1(x) * (1 + mod[:, :, 1, :]) + mod[:, :, 0, :]
+            y = blk.self_attn(x_mod, [gs], self.freqs, self_caches[i], start_frame)
+            x = x + y * mod[:, :, 2, :]
+
+            x_cross = blk.norm3(x) if blk.norm3 is not None else x
+            x = x + blk.cross_attn(x_cross, context, None, kv_cache=cross_kv_caches[i])
+
+            x_mod = blk.norm2(x) * (1 + mod[:, :, 4, :]) + mod[:, :, 3, :]
+            x = x + blk.ffn(x_mod) * mod[:, :, 5, :]
+
+        x = self.head(x, e)
+        return self.unpatchify(x, [gs])[0].astype(mx.float32)
