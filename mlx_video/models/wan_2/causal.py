@@ -225,6 +225,10 @@ class CausalWanModel(WanModel):
         self.sink_size = sink_size
         self.local_attn_size = local_attn_size
         self.num_frame_per_block = num_frame_per_block
+        # Evaluate the residual stream every N layers so a single forward isn't one
+        # giant Metal command buffer (trips the macOS GPU watchdog at native res).
+        # 0 = off (small resolutions don't need it).
+        self.eval_every = 0
 
     def make_self_caches(self, frame_seqlen: int) -> list:
         """One bounded KV-cache per transformer layer."""
@@ -284,6 +288,9 @@ class CausalWanModel(WanModel):
 
             x_mod = blk.norm2(x) * (1 + mod[:, :, 4, :]) + mod[:, :, 3, :]
             x = x + blk.ffn(x_mod) * mod[:, :, 5, :]
+
+            if self.eval_every and (i + 1) % self.eval_every == 0:
+                mx.eval(x, self_caches[i].k, self_caches[i].v)
 
         x = self.head(x, e)
         return self.unpatchify(x, [gs])[0].astype(mx.float32)
