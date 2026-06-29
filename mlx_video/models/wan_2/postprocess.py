@@ -4,25 +4,38 @@ import numpy as np
 
 
 def save_video(frames: np.ndarray, output_path: str, fps: int = 16):
-    """Save video frames to MP4.
+    """Save video frames to an HEVC (hvc1) MP4 via Apple VideoToolbox.
+
+    hevc_videotoolbox ignores libx264's `quality`/CRF knob, so we drive it with a
+    generous bitrate. `-tag:v hvc1` makes the stream play in QuickTime / Photos /
+    AVPlayer (the default `hev1` tag does not).
 
     Args:
         frames: Video frames [T, H, W, 3] uint8
         output_path: Output file path
         fps: Frames per second
     """
+    h, w = int(frames.shape[1]), int(frames.shape[2])
+    bitrate = max(10_000_000, int(w * h * fps * 1.5))  # generous; ~visually lossless
     try:
         import imageio
 
-        writer = imageio.get_writer(output_path, fps=fps, codec="libx264", quality=8)
+        writer = imageio.get_writer(
+            output_path,
+            fps=fps,
+            codec="hevc_videotoolbox",
+            format="FFMPEG",
+            macro_block_size=None,
+            output_params=["-tag:v", "hvc1", "-b:v", str(bitrate)],
+        )
         for frame in frames:
             writer.append_data(frame)
         writer.close()
-    except ImportError:
+    except Exception:
+        # imageio/VideoToolbox unavailable or failed → H.264 via OpenCV, then PNGs.
         try:
             import cv2
 
-            h, w = frames.shape[1], frames.shape[2]
             fourcc = cv2.VideoWriter_fourcc(*"avc1")
             writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
             for frame in frames:
