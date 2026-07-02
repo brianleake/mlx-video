@@ -803,6 +803,10 @@ def generate_video(
             f"{Colors.DIM}  Trimmed first {trim_pixels} frames ({video.shape[0]} remaining){Colors.RESET}"
         )
 
+    # The VAE emits 4 pixel frames per latent, so the decode runs a few frames
+    # past the request — trim to exactly what was asked for.
+    video = video[:num_frames]
+
     save_video(video, output_path, fps=config.sample_fps)
     print(f"\n{Colors.GREEN}✓ Video saved to {output_path}{Colors.RESET}")
     print(f"{Colors.DIM}  Total time: {time.time() - t1:.1f}s{Colors.RESET}")
