@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 from PIL import Image
 from rich.console import Console
@@ -26,6 +27,31 @@ from rich.progress import (
 
 # Rich console for styled output
 console = Console()
+
+
+def _ltx_quantize_predicate(path: str, module, group_size: int = 64) -> bool:
+    """Which LTX transformer layers to quantize (StreamFrame).
+
+    Quantize only the attention (to_q/k/v/out) and feed-forward (proj_in/out)
+    projections in the video *and* audio streams — the bulk of the weights. Skip
+    the patch embed, the final output head, timestep/adaLN tables, the tiny
+    per-head gate logits, and norms: quantizing those costs quality for
+    negligible savings. The divisibility guard also excludes any layer whose
+    matmul dims aren't a multiple of the group size (MLX requires this).
+    """
+    if not isinstance(module, nn.Linear):
+        return False
+    parts = path.split(".")
+    name = parts[-1]
+    parent = parts[-2] if len(parts) >= 2 else ""
+    if name in ("to_q", "to_k", "to_v", "to_out"):
+        pass  # attention projection (video, audio, or a2v) — quantize
+    elif name in ("proj_in", "proj_out") and parent in ("ff", "audio_ff"):
+        pass  # feed-forward projection — quantize (excludes the top-level proj_out head)
+    else:
+        return False
+    w = module.weight
+    return w.shape[0] % group_size == 0 and w.shape[1] % group_size == 0
 
 
 from mlx_video.models.ltx_2.conditioning import (
@@ -1768,6 +1794,7 @@ def generate_video(
     preview_path: Optional[str] = None,
     cond_video: Optional[str] = None,
     cond_frames: int = 9,
+    quantize: int = 0,
 ):
     """Generate video using LTX-2 models.
 
@@ -2014,6 +2041,24 @@ def generate_video(
         )
 
     console.print("[green]✓[/] Transformer loaded")
+
+    # Optional weight quantization (StreamFrame): 8-bit is near-lossless and
+    # roughly halves the transformer's resident memory (~38 GB → ~19 GB); 4-bit
+    # is smaller still with a quality trade-off. Applied in place to the loaded
+    # attention/FFN projections only.
+    if quantize:
+        with console.status(
+            f"[blue]Quantizing transformer to {quantize}-bit (group_size=64)...[/]",
+            spinner="dots",
+        ):
+            nn.quantize(
+                transformer,
+                group_size=64,
+                bits=quantize,
+                class_predicate=lambda p, m: _ltx_quantize_predicate(p, m),
+            )
+            mx.eval(transformer.parameters())
+        console.print(f"[green]✓[/] Transformer quantized ({quantize}-bit)")
 
     # Auto-detect stg_blocks from transformer config if not explicitly provided.
     # LTX-2.3 (has_prompt_adaln=True) uses block 28; LTX-2 uses block 29.
@@ -3277,6 +3322,13 @@ Examples:
     )
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
     parser.add_argument(
+        "--quantize",
+        type=int,
+        default=0,
+        choices=[0, 4, 8],
+        help="Quantize transformer weights: 0=off (bf16), 8=near-lossless, 4=smaller",
+    )
+    parser.add_argument(
         "--enhance-prompt", action="store_true", help="Enhance the prompt using Gemma"
     )
     parser.add_argument(
@@ -3504,6 +3556,7 @@ Examples:
         preview_path=args.preview_path,
         cond_video=args.cond_video,
         cond_frames=args.cond_frames,
+        quantize=args.quantize,
     )
 
 
