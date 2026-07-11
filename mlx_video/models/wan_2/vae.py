@@ -282,11 +282,45 @@ class Resample(nn.Module):
         b, c, t, h, w = x.shape
 
         if self.mode == "upsample3d":
-            # Temporal upsample via learned conv
-            x_t = self.time_conv(x)  # [B, 2C, T, H, W]
-            x_t = x_t.reshape(b, 2, c, t, h, w)
-            x = mx.stack([x_t[:, 0], x_t[:, 1]], axis=3).reshape(b, c, t * 2, h, w)
-            t = t * 2
+            if feat_cache is not None:
+                # Streaming decode: the temporal conv needs the previous chunk's
+                # last CACHE_T frames as left context. The very first chunk has
+                # none, and the reference handles that by skipping time_conv
+                # entirely (marking the slot "Rep") — which is why latent frame 0
+                # expands to ONE pixel frame while every later frame expands to
+                # four. That asymmetry IS the 4n+1 frame convention.
+                idx = feat_idx[0]
+                if feat_cache[idx] is None:
+                    feat_cache[idx] = "Rep"
+                    feat_idx[0] += 1
+                else:
+                    cache_x = x[:, :, -CACHE_T:]
+                    if cache_x.shape[2] < CACHE_T:
+                        if feat_cache[idx] == "Rep":
+                            # Chunk 2: frame 0 never went through time_conv, so
+                            # its left context is genuinely zero.
+                            pad = mx.zeros_like(cache_x)
+                        else:
+                            pad = feat_cache[idx][:, :, -1:]
+                        cache_x = mx.concatenate([pad, cache_x], axis=2)
+                    if feat_cache[idx] == "Rep":
+                        x_t = self.time_conv(x)
+                    else:
+                        x_t = self.time_conv(x, cache_x=feat_cache[idx])
+                    feat_cache[idx] = cache_x
+                    feat_idx[0] += 1
+
+                    x_t = x_t.reshape(b, 2, c, t, h, w)
+                    x = mx.stack([x_t[:, 0], x_t[:, 1]], axis=3).reshape(
+                        b, c, t * 2, h, w
+                    )
+                    t = t * 2
+            else:
+                # Whole-sequence decode: temporal upsample via learned conv.
+                x_t = self.time_conv(x)  # [B, 2C, T, H, W]
+                x_t = x_t.reshape(b, 2, c, t, h, w)
+                x = mx.stack([x_t[:, 0], x_t[:, 1]], axis=3).reshape(b, c, t * 2, h, w)
+                t = t * 2
 
         if self.mode.startswith("upsample"):
             # Per-frame spatial upsample: nearest 2x + Conv2d
@@ -375,18 +409,51 @@ class Decoder3d(nn.Module):
             CausalConv3d(dims[-1], 3, 3, padding=1),  # [2]
         ]
 
-    def __call__(self, x: mx.array) -> mx.array:
-        """x: [B, z_dim, T, H, W] -> [B, 3, T_out, H_out, W_out]"""
-        x = self.conv1(x)
+    def __call__(self, x: mx.array, feat_cache=None, feat_idx=None) -> mx.array:
+        """x: [B, z_dim, T, H, W] -> [B, 3, T_out, H_out, W_out]
+
+        With `feat_cache` the decode is *streaming*: each causal temporal conv
+        reads its own last-CACHE_T inputs from the cache instead of zero-padding,
+        so a clip decoded chunk-by-chunk is identical to one decoded whole. Mirror
+        of `Encoder3d.__call__` — the traversal order here defines the slot
+        numbering that `_count_decoder_cache_slots` counts.
+        """
+        if feat_cache is not None:
+            idx = feat_idx[0]
+            cache_x = x[:, :, -CACHE_T:]
+            if cache_x.shape[2] < CACHE_T and feat_cache[idx] is not None:
+                cache_x = mx.concatenate([feat_cache[idx][:, :, -1:], cache_x], axis=2)
+            x = self.conv1(x, cache_x=feat_cache[idx])
+            feat_cache[idx] = cache_x
+            feat_idx[0] += 1
+        else:
+            x = self.conv1(x)
 
         for layer in self.middle:
-            x = layer(x)
+            if feat_cache is not None and isinstance(layer, ResidualBlock):
+                x = layer(x, feat_cache=feat_cache, feat_idx=feat_idx)
+            else:
+                x = layer(x)
 
         for layer in self.upsamples:
-            x = layer(x)
+            if feat_cache is not None and isinstance(layer, (ResidualBlock, Resample)):
+                x = layer(x, feat_cache=feat_cache, feat_idx=feat_idx)
+            else:
+                x = layer(x)
 
-        x = nn.silu(self.head[0](x))
-        x = self.head[2](x)
+        if feat_cache is not None:
+            x = nn.silu(self.head[0](x))
+            idx = feat_idx[0]
+            cache_x = x[:, :, -CACHE_T:]
+            if cache_x.shape[2] < CACHE_T and feat_cache[idx] is not None:
+                cache_x = mx.concatenate([feat_cache[idx][:, :, -1:], cache_x], axis=2)
+            x = self.head[2](x, cache_x=feat_cache[idx])
+            feat_cache[idx] = cache_x
+            feat_idx[0] += 1
+        else:
+            x = nn.silu(self.head[0](x))
+            x = self.head[2](x)
+
         return x
 
 
@@ -557,6 +624,62 @@ class WanVAE(nn.Module):
                 count += 2
         count += 1  # encoder.head CausalConv3d
         return count
+
+    def _count_decoder_cache_slots(self) -> int:
+        """Count the CausalConv3d slots Decoder3d consumes, in traversal order."""
+        count = 1  # decoder.conv1
+        for layer in self.decoder.middle:
+            if isinstance(layer, ResidualBlock):
+                count += 2  # two convs in the residual path
+        for layer in self.decoder.upsamples:
+            if isinstance(layer, ResidualBlock):
+                count += 2
+            elif isinstance(layer, Resample) and layer.mode == "upsample3d":
+                count += 1  # time_conv
+        count += 1  # decoder.head CausalConv3d
+        return count
+
+    def make_decode_cache(self) -> list:
+        """Fresh streaming-decode state. Hold one of these across a whole clip and
+        feed it to `decode_stream` chunk by chunk; reset it per clip."""
+        return [None] * self._count_decoder_cache_slots()
+
+    def decode_stream(self, z: mx.array, feat_cache: list) -> mx.array:
+        """Decode latents as a *continuation* of everything already decoded into
+        `feat_cache` — the streaming counterpart of `decode`.
+
+        Without this, each independently-decoded chunk restarts the decoder's
+        causal temporal convolutions against zero-padding, so its leading frames
+        are reconstructed with no knowledge of their real past and the seam shows
+        as a pop. Threading feat_cache makes the result independent of where the
+        chunk boundaries fall: decoding a clip in pieces equals decoding it in one
+        call *through this method*.
+
+        Note it is NOT equal to `decode()`, which is a different function: whole-
+        sequence decode runs time_conv over frame 0 too and yields 4T frames,
+        where this yields 4(T−1)+1 — latent frame 0 → 1 pixel frame, each later
+        latent → 4. That is the reference behavior and Wan's native 4n+1 frame
+        convention, so callers need no trimming.
+
+        Args:
+            z: Normalized latent [B, z_dim, T, H, W] — the next T latent frames.
+            feat_cache: state from `make_decode_cache`, mutated in place.
+
+        Returns:
+            Video [B, 3, T_out, H_out, W_out] clamped to [-1, 1]
+        """
+        mean = self.mean.reshape(1, -1, 1, 1, 1)
+        inv_std = self.inv_std.reshape(1, -1, 1, 1, 1)
+        x = self.conv2(z / inv_std + mean)  # 1×1×1 conv — no temporal context
+
+        out = []
+        for i in range(x.shape[2]):
+            feat_idx = [0]
+            frame = self.decoder(
+                x[:, :, i : i + 1], feat_cache=feat_cache, feat_idx=feat_idx
+            )
+            out.append(mx.clip(frame, -1, 1))
+        return mx.concatenate(out, axis=2)
 
     def decode(self, z: mx.array) -> mx.array:
         """Decode latent to video.
