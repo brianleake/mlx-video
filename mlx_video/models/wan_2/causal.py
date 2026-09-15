@@ -16,11 +16,46 @@ the bidirectional full-sequence attention for the cached causal path.
 """
 from __future__ import annotations
 
+import os
+
 import mlx.core as mx
 import mlx.nn as nn
 
 from .attention import WanRMSNorm, _linear_dtype
 from .wan_2 import WanModel
+
+# StreamFrame: query-chunked attention (opt-in). A block's queries attend over
+# the whole KV cache in one Metal dispatch — at 832x480 about 1.5k queries x 39k
+# keys. Splitting the queries, each chunk evaluated before the next, bounds a
+# dispatch; every query still attends to all keys, so the output is unchanged.
+# Measured on M2 Ultra (Rolling-Forcing 832x480x121f, budget 16M): bitwise
+# identical to unchunked, same peak memory, but 22% slower end to end (the
+# per-chunk evals break the lazy graph; Wan's per-block query count is too small
+# for the MiniMax-H3 win to carry over) and the unchunked run did not crash.
+# Off by default (0); set STREAMFRAME_SDPA_QK_BUDGET=<query rows x key rows> to
+# enable for watchdog experiments.
+_SDPA_QK_BUDGET = int(os.environ.get("STREAMFRAME_SDPA_QK_BUDGET", "0"))
+
+
+def chunked_sdpa(q: mx.array, k: mx.array, v: mx.array, scale: float) -> mx.array:
+    """Unmasked mx.fast.scaled_dot_product_attention over [B, N, L, D], with queries
+    split into chunks of budget // key rows."""
+    seq, keys = q.shape[2], k.shape[2]
+    chunk = max(64, _SDPA_QK_BUDGET // max(keys, 1)) if _SDPA_QK_BUDGET > 0 else seq
+    if seq <= chunk:
+        return mx.fast.scaled_dot_product_attention(q, k, v, scale=scale)
+    try:
+        mx.eval(q, k, v)
+    except ValueError:  # inside mx.compile / vmap: eval is not allowed
+        return mx.fast.scaled_dot_product_attention(q, k, v, scale=scale)
+    outs = []
+    for start in range(0, seq, chunk):
+        out = mx.fast.scaled_dot_product_attention(
+            q[:, :, start : start + chunk], k, v, scale=scale
+        )
+        mx.eval(out)
+        outs.append(out)
+    return mx.concatenate(outs, axis=2)
 
 
 def causal_rope_apply(
@@ -208,7 +243,7 @@ class WanCausalSelfAttention(nn.Module):
             window_kv[0] = k if wk is None else mx.concatenate([wk, k], axis=1)
             window_kv[1] = v if wv is None else mx.concatenate([wv, v], axis=1)
 
-        out = mx.fast.scaled_dot_product_attention(
+        out = chunked_sdpa(
             q.transpose(0, 2, 1, 3),
             full_k.transpose(0, 2, 1, 3),
             full_v.transpose(0, 2, 1, 3),
