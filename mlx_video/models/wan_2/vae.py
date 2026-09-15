@@ -153,13 +153,15 @@ class RMS_norm(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         norm_dim = 1 if self.channel_first else -1
-        # L2 normalize along channel dim (matches F.normalize)
+        # L2 normalize along channel dim (matches F.normalize). Reduced in
+        # float32: with float16 activations the sum of squares overflows half.
+        xf = x.astype(mx.float32)
         norm = mx.sqrt(
             mx.clip(
-                mx.sum(x * x, axis=norm_dim, keepdims=True), a_min=1e-12, a_max=None
+                mx.sum(xf * xf, axis=norm_dim, keepdims=True), a_min=1e-12, a_max=None
             )
         )
-        return (x / norm) * self.scale * self.gamma
+        return ((xf / norm) * self.scale * self.gamma.astype(mx.float32)).astype(x.dtype)
 
 
 class ResidualBlock(nn.Module):
@@ -586,6 +588,7 @@ class WanVAE(nn.Module):
         num_slots = self._count_encoder_cache_slots()
         feat_cache = [None] * num_slots
 
+        x = x.astype(self._wdtype)
         t = x.shape[2]
         num_chunks = 1 + (t - 1) // 4
 
@@ -606,10 +609,22 @@ class WanVAE(nn.Module):
 
         mu, _ = mx.split(self.conv1(out), 2, axis=1)
 
-        # Normalize: (mu - mean) * inv_std
+        # Normalize: (mu - mean) * inv_std — latents are float32 regardless of
+        # the VAE's compute dtype (they feed the sampler alongside the noise).
         mean = self.mean.reshape(1, -1, 1, 1, 1)
         inv_std = self.inv_std.reshape(1, -1, 1, 1, 1)
-        return (mu - mean) * inv_std
+        return (mu.astype(mx.float32) - mean) * inv_std
+
+    @property
+    def _wdtype(self) -> mx.Dtype:
+        """Compute dtype = the loaded weights' dtype (float32 or float16)."""
+        return self.conv2.weight.dtype
+
+    def _denorm(self, z: mx.array) -> mx.array:
+        """Normalized float32 latent -> decoder input in the compute dtype."""
+        mean = self.mean.reshape(1, -1, 1, 1, 1)
+        inv_std = self.inv_std.reshape(1, -1, 1, 1, 1)
+        return (z.astype(mx.float32) / inv_std + mean).astype(self._wdtype)
 
     def _count_encoder_cache_slots(self) -> int:
         """Count CausalConv3d that participate in chunked encoding cache."""
@@ -668,9 +683,7 @@ class WanVAE(nn.Module):
         Returns:
             Video [B, 3, T_out, H_out, W_out] clamped to [-1, 1]
         """
-        mean = self.mean.reshape(1, -1, 1, 1, 1)
-        inv_std = self.inv_std.reshape(1, -1, 1, 1, 1)
-        x = self.conv2(z / inv_std + mean)  # 1×1×1 conv — no temporal context
+        x = self.conv2(self._denorm(z))  # 1×1×1 conv — no temporal context
 
         out = []
         for i in range(x.shape[2]):
@@ -690,11 +703,7 @@ class WanVAE(nn.Module):
         Returns:
             Video [B, 3, T_out, H_out, W_out] clamped to [-1, 1]
         """
-        mean = self.mean.reshape(1, -1, 1, 1, 1)
-        inv_std = self.inv_std.reshape(1, -1, 1, 1, 1)
-        z = z / inv_std + mean
-
-        x = self.conv2(z)
+        x = self.conv2(self._denorm(z))
         out = self.decoder(x)
         return mx.clip(out, -1, 1)
 
@@ -733,9 +742,7 @@ class WanVAE(nn.Module):
             return self.decode(z)
 
         # Denormalize once (small tensor), then tile the denormalized latents
-        mean = self.mean.reshape(1, -1, 1, 1, 1)
-        inv_std = self.inv_std.reshape(1, -1, 1, 1, 1)
-        z_denorm = z / inv_std + mean
+        z_denorm = self._denorm(z)
 
         def tile_decode(tile_latents, **kwargs):
             x = self.conv2(tile_latents)

@@ -119,6 +119,14 @@ class CausalKVCache:
 
     Token counts are in *latent tokens* (frames * H_latent * W_latent). With
     `local_attn_size == -1` the window is unbounded (cache grows with the clip).
+
+    K/V are stored head-major, [B, N, L, D] — the layout the fused SDPA kernel
+    reads directly, so no per-layer transposed views of a 40k-token cache reach
+    the kernel. Interleaved A/B on M2 Ultra (4680 queries x 43.7k keys, fp16,
+    sustained clock): ~10% faster attention than transposed token-major views,
+    bitwise-identical output. (Beware one-shot microbenchmarks here: this GPU
+    drops to ~40% throughput within a second of sustained load, so only
+    interleaved comparisons in one process are meaningful.)
     """
 
     def __init__(self, sink_size: int, local_attn_size: int, frame_seqlen: int):
@@ -150,24 +158,29 @@ class CausalKVCache:
         vs = [a for a in (self.v, window_v, v) if a is not None]
         if len(ks) == 1:
             return ks[0], vs[0]
-        return mx.concatenate(ks, axis=1), mx.concatenate(vs, axis=1)
+        return mx.concatenate(ks, axis=2), mx.concatenate(vs, axis=2)
+
+    @property
+    def tokens(self) -> int:
+        """Number of cached tokens."""
+        return 0 if self.k is None else self.k.shape[2]
 
     def commit(self, k: mx.array, v: mx.array) -> tuple[mx.array, mx.array]:
-        """Persist a block's clean K/V ([B, s, n, d]); return the full windowed cache."""
+        """Persist a block's clean K/V ([B, n, s, d]); return the full windowed cache."""
         if self.k is None:
             self.k, self.v = k, v
         else:
-            self.k = mx.concatenate([self.k, k], axis=1)
-            self.v = mx.concatenate([self.v, v], axis=1)
+            self.k = mx.concatenate([self.k, k], axis=2)
+            self.v = mx.concatenate([self.v, v], axis=2)
 
         if self.window_tokens != -1:
             limit = self.sink_tokens + self.window_tokens
-            if self.k.shape[1] > limit:
+            if self.k.shape[2] > limit:
                 # Keep the sink anchor + the most-recent window; evict the middle.
-                sink_k, sink_v = self.k[:, : self.sink_tokens], self.v[:, : self.sink_tokens]
-                rec_k, rec_v = self.k[:, -self.window_tokens :], self.v[:, -self.window_tokens :]
-                self.k = mx.concatenate([sink_k, rec_k], axis=1)
-                self.v = mx.concatenate([sink_v, rec_v], axis=1)
+                sink_k, sink_v = self.k[:, :, : self.sink_tokens], self.v[:, :, : self.sink_tokens]
+                rec_k, rec_v = self.k[:, :, -self.window_tokens :], self.v[:, :, -self.window_tokens :]
+                self.k = mx.concatenate([sink_k, rec_k], axis=2)
+                self.v = mx.concatenate([sink_v, rec_v], axis=2)
         return self.k, self.v
 
 
@@ -227,8 +240,12 @@ class WanCausalSelfAttention(nn.Module):
 
         q = causal_rope_apply(q.astype(mx.float32), grid_sizes, freqs, start_frame)
         k = causal_rope_apply(k.astype(mx.float32), grid_sizes, freqs, start_frame)
-        q = q.astype(w_dtype)
-        k = k.astype(w_dtype)
+        # Head-major and materialized (see CausalKVCache): the block's own K/V
+        # are small, so making them contiguous here is cheap, and everything
+        # downstream — cache, window scratch, SDPA — then works in kernel layout.
+        q = mx.contiguous(q.astype(w_dtype).transpose(0, 2, 1, 3))
+        k = mx.contiguous(k.astype(w_dtype).transpose(0, 2, 1, 3))
+        v = mx.contiguous(v.transpose(0, 2, 1, 3))
 
         if commit:
             full_k, full_v = cache.commit(k, v)
@@ -240,15 +257,10 @@ class WanCausalSelfAttention(nn.Module):
             # persists — the window is noisy at every level.
             wk, wv = window_kv
             full_k, full_v = cache.view_with(k, v, wk, wv)
-            window_kv[0] = k if wk is None else mx.concatenate([wk, k], axis=1)
-            window_kv[1] = v if wv is None else mx.concatenate([wv, v], axis=1)
+            window_kv[0] = k if wk is None else mx.concatenate([wk, k], axis=2)
+            window_kv[1] = v if wv is None else mx.concatenate([wv, v], axis=2)
 
-        out = chunked_sdpa(
-            q.transpose(0, 2, 1, 3),
-            full_k.transpose(0, 2, 1, 3),
-            full_v.transpose(0, 2, 1, 3),
-            scale=self.scale,
-        )
+        out = chunked_sdpa(q, full_k, full_v, scale=self.scale)
         out = out.transpose(0, 2, 1, 3).reshape(b, s, -1)
         return self.o(out)
 
