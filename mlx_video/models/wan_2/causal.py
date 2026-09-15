@@ -58,26 +58,19 @@ def chunked_sdpa(q: mx.array, k: mx.array, v: mx.array, scale: float) -> mx.arra
     return mx.concatenate(outs, axis=2)
 
 
-def causal_rope_apply(
-    x: mx.array, grid_sizes: list, freqs: mx.array, start_frame: int = 0
-) -> mx.array:
-    """3-way factorized RoPE with the temporal axis offset by `start_frame`.
+def causal_rope_tables(
+    grid: tuple, freqs: mx.array, start_frame: int, dtype=mx.float32
+) -> tuple:
+    """Per-position (cos, sin) for one block, each [seq_len, 1, head_dim // 2].
 
-    Identical to `rope_apply` (non-precomputed path) except the temporal
-    frequencies are indexed `[start_frame : start_frame + f]` so a block emitted
-    partway through the stream gets its absolute temporal positions.
-
-    Args:
-        x: [B, L, num_heads, head_dim]
-        grid_sizes: list of (F, H, W) per batch element (F = frames in this block)
-        freqs: [max_len, head_dim // 2, 2]
-        start_frame: absolute frame index of this block's first frame
+    3-way factorized RoPE with the temporal axis offset by `start_frame`, so a
+    block emitted partway through the stream gets its absolute temporal
+    positions. Built ONCE per block in `generate_block` and shared by all 30
+    layers' q and k rotations (previously rebuilt in every layer).
     """
-    b, s, n, d = x.shape
-    half_d = d // 2
-    if freqs.dtype != x.dtype:
-        freqs = freqs.astype(x.dtype)
-
+    if freqs.dtype != dtype:
+        freqs = freqs.astype(dtype)
+    half_d = freqs.shape[1]
     d_t = half_d - 2 * (half_d // 3)
     d_h = half_d // 3
     d_w = half_d // 3
@@ -85,22 +78,44 @@ def causal_rope_apply(
     freqs_h = freqs[:, d_t : d_t + d_h]
     freqs_w = freqs[:, d_t + d_h : d_t + d_h + d_w]
 
+    f, h, w = grid
+    seq_len = f * h * w
+    ft = mx.broadcast_to(
+        freqs_t[start_frame : start_frame + f].reshape(f, 1, 1, d_t, 2),
+        (f, h, w, d_t, 2),
+    )
+    fh = mx.broadcast_to(freqs_h[:h].reshape(1, h, 1, d_h, 2), (f, h, w, d_h, 2))
+    fw = mx.broadcast_to(freqs_w[:w].reshape(1, 1, w, d_w, 2), (f, h, w, d_w, 2))
+    freqs_i = mx.concatenate([ft, fh, fw], axis=3).reshape(seq_len, 1, half_d, 2)
+    return freqs_i[..., 0], freqs_i[..., 1]
+
+
+def causal_rope_apply(
+    x: mx.array, grid_sizes: list, freqs: mx.array, start_frame: int = 0,
+    tables: tuple | None = None,
+) -> mx.array:
+    """Apply 3-way factorized RoPE (see `causal_rope_tables`) to q or k.
+
+    Args:
+        x: [B, L, num_heads, head_dim]
+        grid_sizes: list of (F, H, W) per batch element (F = frames in this block)
+        freqs: [max_len, head_dim // 2, 2]
+        start_frame: absolute frame index of this block's first frame
+        tables: optional precomputed (cos, sin) from `causal_rope_tables` for
+            grid_sizes[0] / start_frame (B must be 1); built here if None.
+    """
+    b, s, n, d = x.shape
+    half_d = d // 2
+    if tables is not None:
+        assert b == 1
     outputs = []
     for i in range(b):
         f, h, w = grid_sizes[i]
         seq_len = f * h * w
         x_i = x[i, :seq_len].reshape(seq_len, n, half_d, 2)
 
-        ft = mx.broadcast_to(
-            freqs_t[start_frame : start_frame + f].reshape(f, 1, 1, d_t, 2),
-            (f, h, w, d_t, 2),
-        )
-        fh = mx.broadcast_to(freqs_h[:h].reshape(1, h, 1, d_h, 2), (f, h, w, d_h, 2))
-        fw = mx.broadcast_to(freqs_w[:w].reshape(1, 1, w, d_w, 2), (f, h, w, d_w, 2))
-        freqs_i = mx.concatenate([ft, fh, fw], axis=3).reshape(seq_len, 1, half_d, 2)
-
-        cos_f = freqs_i[..., 0]
-        sin_f = freqs_i[..., 1]
+        cos_f, sin_f = (tables if tables is not None
+                        else causal_rope_tables((f, h, w), freqs, start_frame, x.dtype))
         x_real = x_i[..., 0]
         x_imag = x_i[..., 1]
         out_real = x_real * cos_f - x_imag * sin_f
@@ -221,6 +236,7 @@ class WanCausalSelfAttention(nn.Module):
         start_frame: int,
         commit: bool = False,
         window_kv: list | None = None,
+        rope_tables: tuple | None = None,
     ) -> mx.array:
         b, s, _ = x.shape
         n, d = self.num_heads, self.head_dim
@@ -238,8 +254,8 @@ class WanCausalSelfAttention(nn.Module):
         k = k.reshape(b, s, n, d)
         v = self.v(x_w).reshape(b, s, n, d)
 
-        q = causal_rope_apply(q.astype(mx.float32), grid_sizes, freqs, start_frame)
-        k = causal_rope_apply(k.astype(mx.float32), grid_sizes, freqs, start_frame)
+        q = causal_rope_apply(q.astype(mx.float32), grid_sizes, freqs, start_frame, rope_tables)
+        k = causal_rope_apply(k.astype(mx.float32), grid_sizes, freqs, start_frame, rope_tables)
         # Head-major and materialized (see CausalKVCache): the block's own K/V
         # are small, so making them contiguous here is cheap, and everything
         # downstream — cache, window scratch, SDPA — then works in kernel layout.
@@ -346,23 +362,29 @@ class CausalWanModel(WanModel):
         p, gs = self._patchify(x_block)  # [1, S, dim], gs = (F, H, W)
         f, h, w = gs
         fsl = h * w
-        S = f * fsl
         x = p
 
         # Per-frame timestep -> per-token, then the standard sinusoidal time MLP.
+        # (Every current caller passes one timestep per block, so this could be
+        # computed for a single position and broadcast; measured ~1% and it
+        # changes rounding, so per-token stays for bitwise reproducibility.)
         if t_block.ndim == 0:
             t_block = mx.broadcast_to(t_block[None], (f,))
         t_tok = mx.repeat(t_block, fsl)[None]  # [1, S]
         sinusoid = t_tok[..., None].astype(mx.float32) * self._inv_freq
         sin_emb = mx.concatenate([mx.cos(sinusoid), mx.sin(sinusoid)], axis=-1)
         e = self.time_embedding_1(self.time_embedding_act(self.time_embedding_0(sin_emb)))
-        e0 = self.time_projection(self.time_projection_act(e)).reshape(1, S, 6, self.dim)
+        e0 = self.time_projection(self.time_projection_act(e)).reshape(1, -1, 6, self.dim)
+
+        # RoPE (cos, sin) for this block, shared by all layers' q and k.
+        rope_tables = causal_rope_tables(gs, self.freqs, start_frame)
 
         for i, blk in enumerate(self.blocks):
             mod = blk.modulation + e0  # [1, S, 6, dim] (float32)
             x_mod = blk.norm1(x) * (1 + mod[:, :, 1, :]) + mod[:, :, 0, :]
             y = blk.self_attn(x_mod, [gs], self.freqs, self_caches[i], start_frame,
-                              commit, window_kvs[i] if window_kvs is not None else None)
+                              commit, window_kvs[i] if window_kvs is not None else None,
+                              rope_tables)
             x = x + y * mod[:, :, 2, :]
 
             x_cross = blk.norm3(x) if blk.norm3 is not None else x
